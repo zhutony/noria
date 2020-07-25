@@ -72,7 +72,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
     eprintln!("Prepopulating with {} articles", narticles);
     articles
         .perform_all(
-            (0..narticles).map(|i| vec![(i as i32).into(), format!("Article #{}", i + 1).into()]),
+            (0..narticles).map(|i| vec![(i as usize).into(), format!("Article #{}", i + 1).into()]),
         )
         .await
         .unwrap();
@@ -88,7 +88,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
         let done = done.clone();
         let barrier = barrier.clone();
         tokio::spawn(async move {
-            let zipf = ZipfDistribution::new(narticles, 1.08).unwrap();
+            let zipf = ZipfDistribution::new(narticles, 1.15).unwrap();
             barrier.wait().await;
 
             let mut reporter = Reporter::new(every);
@@ -99,7 +99,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
                         // always generate both so that we aren't artifically faster with one
                         let id_uniform = rand::thread_rng().gen_range(0, narticles);
                         let id_zipf = zipf.sample(&mut rand::thread_rng());
-                        let id = if skewed { id_zipf } else { id_uniform };
+                        let id: usize = if skewed { id_zipf } else { id_uniform };
                         TableOperation::from(vec![DataType::from(id), i.into()])
                     }))
                     .await
@@ -122,14 +122,21 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
         let done = done.clone();
         let barrier = barrier.clone();
         tokio::spawn(async move {
-            let zipf = ZipfDistribution::new(narticles, 1.08).unwrap();
+            let zipf = ZipfDistribution::new(narticles, 1.15).unwrap();
             barrier.wait().await;
             let start = time::Instant::now();
+            let mut succeeded = false;
             while start.elapsed() < runtime {
                 let id_uniform = rand::thread_rng().gen_range(0, narticles);
                 let id_zipf = zipf.sample(&mut rand::thread_rng());
-                let id = if skewed { id_zipf } else { id_uniform };
-                read_old.lookup(&[DataType::from(id)], false).await.unwrap();
+                let id: usize = if skewed { id_zipf } else { id_uniform };
+                let r = read_old.lookup(&[DataType::from(id)], false).await;
+                if succeeded && !r.is_ok() {
+                    // an error occurred after the view became available...
+                    r.unwrap();
+                    return;
+                }
+                succeeded = r.is_ok();
                 tokio::time::delay_for(time::Duration::from_micros(10)).await;
             }
 
@@ -171,7 +178,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
         let stat = stat.clone();
         let barrier = barrier.clone();
         tokio::spawn(async move {
-            let zipf = ZipfDistribution::new(narticles, 1.08).unwrap();
+            let zipf = ZipfDistribution::new(narticles, 1.15).unwrap();
             barrier.wait().await;
 
             let mut reporter = Reporter::new(every);
@@ -180,7 +187,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
                     .perform_all((0..WRITE_BATCH_SIZE).map(|i| {
                         let id_uniform = rand::thread_rng().gen_range(0, narticles);
                         let id_zipf = zipf.sample(&mut rand::thread_rng());
-                        let id = if skewed { id_zipf } else { id_uniform };
+                        let id: usize = if skewed { id_zipf } else { id_uniform };
                         TableOperation::from(vec![DataType::from(id), i.into(), 5.into()])
                     }))
                     .await
@@ -206,7 +213,7 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
         tokio::spawn(async move {
             let n = 100;
             let mut hits = 0;
-            let zipf = ZipfDistribution::new(narticles, 1.08).unwrap();
+            let zipf = ZipfDistribution::new(narticles, 1.15).unwrap();
             let mut reporter = Reporter::new(every);
             barrier.wait().await;
             while start.elapsed() < runtime {
@@ -214,7 +221,8 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
                     .map(|_| {
                         let id_uniform = rand::thread_rng().gen_range(0, narticles);
                         let id_zipf = zipf.sample(&mut rand::thread_rng());
-                        vec![DataType::from(if skewed { id_zipf } else { id_uniform })]
+                        let id: usize = if skewed { id_zipf } else { id_uniform };
+                        vec![DataType::from(id)]
                     })
                     .collect();
                 if let Ok(rss) = read_new.multi_lookup(ids, false).await {
@@ -244,6 +252,9 @@ async fn one(s: &graph::Builder, skewed: bool, args: &clap::ArgMatches<'_>, w: O
     stat.send(("FIN", 0.0)).unwrap();
     drop(stat);
     stats.join().unwrap();
+
+    g.graph.shutdown();
+    g.done.await;
 }
 
 #[tokio::main]
@@ -347,7 +358,7 @@ async fn main() {
             true,
             &args,
             Some(
-                fs::File::create(format!("vote-no-partial-stupid-{}M.zipf1.08.log", mills))
+                fs::File::create(format!("vote-no-partial-stupid-{}M.zipf1.15.log", mills))
                     .unwrap(),
             ),
         )
@@ -369,7 +380,7 @@ async fn main() {
             &s,
             true,
             &args,
-            Some(fs::File::create(format!("vote-partial-reuse-{}M.zipf1.08.log", mills)).unwrap()),
+            Some(fs::File::create(format!("vote-partial-reuse-{}M.zipf1.15.log", mills)).unwrap()),
         )
         .await;
 
@@ -410,7 +421,7 @@ async fn main() {
             true,
             &args,
             Some(
-                fs::File::create(format!("vote-no-partial-reuse-{}M.zipf1.08.log", mills)).unwrap(),
+                fs::File::create(format!("vote-no-partial-reuse-{}M.zipf1.15.log", mills)).unwrap(),
             ),
         )
         .await;
@@ -431,7 +442,7 @@ async fn main() {
             &s,
             true,
             &args,
-            Some(fs::File::create(format!("vote-partial-stupid-{}M.zipf1.08.log", mills)).unwrap()),
+            Some(fs::File::create(format!("vote-partial-stupid-{}M.zipf1.15.log", mills)).unwrap()),
         )
         .await;
     } else {

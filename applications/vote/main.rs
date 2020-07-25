@@ -3,30 +3,30 @@
 use clap::value_t_or_exit;
 use failure::ResultExt;
 use futures_util::future::{Either, FutureExt, TryFutureExt};
-use hdrhistogram::Histogram;
+use futures_util::stream::futures_unordered::FuturesUnordered;
+use noria_applications::Timeline;
 use rand::prelude::*;
 use rand_distr::Exp;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs;
 use std::mem;
-use std::sync::{atomic, Arc, Barrier, Mutex};
+use std::sync::{atomic, Arc, Mutex};
 use std::task::Poll;
 use std::thread;
 use std::time;
+use tokio::stream::StreamExt;
 use tower_service::Service;
 
 thread_local! {
-    static SJRN_W: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static SJRN_R: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static RMT_W: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static RMT_R: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
+    static TIMING: RefCell<(Timeline, Timeline)> = RefCell::new(Default::default());
 }
 
 fn throughput(ops: usize, took: time::Duration) -> f64 {
     ops as f64 / took.as_secs_f64()
 }
 
-const MAX_BATCH_TIME_US: u32 = 1000;
+const MAX_BATCH_TIME: time::Duration = time::Duration::from_millis(10);
 
 mod clients;
 use self::clients::{Parameters, ReadRequest, VoteClient, WriteRequest};
@@ -48,7 +48,6 @@ where
     let ngen = (target as usize + per_generator - 1) / per_generator; // rounded up
     target /= ngen as f64;
 
-    let nthreads = value_t_or_exit!(global_args, "threads", usize);
     let articles = value_t_or_exit!(global_args, "articles", usize);
 
     let params = Parameters {
@@ -62,60 +61,28 @@ where
         _ => unreachable!(),
     };
 
-    let hists = if let Some(mut f) = global_args
-        .value_of("histogram")
-        .and_then(|h| fs::File::open(h).ok())
-    {
-        use hdrhistogram::serialization::Deserializer;
-        let mut deserializer = Deserializer::new();
-        (
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-        )
-    } else {
-        (
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-        )
-    };
+    let write_t = Arc::new(Mutex::new(Timeline::default()));
+    let read_t = Arc::new(Mutex::new(Timeline::default()));
 
-    let sjrn_w_t = Arc::new(Mutex::new(hists.0));
-    let sjrn_r_t = Arc::new(Mutex::new(hists.1));
-    let rmt_w_t = Arc::new(Mutex::new(hists.2));
-    let rmt_r_t = Arc::new(Mutex::new(hists.3));
-    let finished = Arc::new(Barrier::new(nthreads + ngen));
+    let ts = (write_t.clone(), read_t.clone());
 
-    let ts = (
-        sjrn_w_t.clone(),
-        sjrn_r_t.clone(),
-        rmt_w_t.clone(),
-        rmt_r_t.clone(),
-        finished.clone(),
-    );
+    let available_cores = num_cpus::get() - ngen;
     let mut rt = tokio::runtime::Builder::new()
         .enable_all()
         .threaded_scheduler()
         .thread_name("voter")
+        .core_threads(available_cores)
         .on_thread_stop(move || {
-            SJRN_W
-                .with(|h| ts.0.lock().unwrap().add(&*h.borrow()))
-                .unwrap();
-            SJRN_R
-                .with(|h| ts.1.lock().unwrap().add(&*h.borrow()))
-                .unwrap();
-            RMT_W
-                .with(|h| ts.2.lock().unwrap().add(&*h.borrow()))
-                .unwrap();
-            RMT_R
-                .with(|h| ts.3.lock().unwrap().add(&*h.borrow()))
-                .unwrap();
+            TIMING.with(|hs| {
+                let hs = hs.borrow();
+                ts.0.lock().unwrap().merge(&hs.0);
+                ts.1.lock().unwrap().merge(&hs.1);
+            })
         })
         .build()
         .unwrap();
+
+    eprintln!("setting up client");
 
     let handle: C = {
         let local_args = local_args.clone();
@@ -124,6 +91,11 @@ where
         rt.block_on(async move { C::new(params, local_args).await.unwrap() })
     };
 
+    rt.block_on(async { tokio::time::delay_for(time::Duration::from_secs(1)).await });
+
+    eprintln!("setup completed");
+
+    let start = std::time::SystemTime::now();
     let errd: &'static _ = &*Box::leak(Box::new(atomic::AtomicBool::new(false)));
     let generators: Vec<_> = (0..ngen)
         .map(|geni| {
@@ -142,7 +114,7 @@ where
                             handle,
                             errd,
                             ex,
-                            zipf::ZipfDistribution::new(articles, 1.08).unwrap(),
+                            zipf::ZipfDistribution::new(articles, 1.15).unwrap(),
                             target,
                             global_args,
                         )
@@ -163,10 +135,12 @@ where
 
     let mut ops = 0.0;
     let mut wops = 0.0;
+    let mut duration = time::Duration::new(0, 0);
     for gen in generators {
-        let (gen, completed) = gen.join().unwrap();
+        let (gen, completed, took) = gen.join().unwrap();
         ops += gen;
         wops += completed;
+        duration = duration.max(took);
     }
     drop(handle);
     drop(rt);
@@ -176,21 +150,24 @@ where
     println!("# actual ops/s: {:.2}", wops);
     println!("# op\tpct\tsojourn\tremote");
 
-    let sjrn_w_t = sjrn_w_t.lock().unwrap();
-    let sjrn_r_t = sjrn_r_t.lock().unwrap();
-    let rmt_w_t = rmt_w_t.lock().unwrap();
-    let rmt_r_t = rmt_r_t.lock().unwrap();
+    let mut write_t = write_t.lock().unwrap();
+    let mut read_t = read_t.lock().unwrap();
+
+    write_t.set_total_duration(duration);
+    read_t.set_total_duration(duration);
 
     if let Some(h) = global_args.value_of("histogram") {
         match fs::File::create(h) {
             Ok(mut f) => {
-                use hdrhistogram::serialization::Serializer;
-                use hdrhistogram::serialization::V2Serializer;
-                let mut s = V2Serializer::new();
-                s.serialize(&sjrn_w_t, &mut f).unwrap();
-                s.serialize(&sjrn_r_t, &mut f).unwrap();
-                s.serialize(&rmt_w_t, &mut f).unwrap();
-                s.serialize(&rmt_r_t, &mut f).unwrap();
+                use hdrhistogram::serialization::interval_log;
+                use hdrhistogram::serialization::V2DeflateSerializer;
+                let mut s = V2DeflateSerializer::new();
+                let mut w = interval_log::IntervalLogWriterBuilder::new()
+                    .with_base_time(start)
+                    .begin_log_with(&mut f, &mut s)
+                    .unwrap();
+                write_t.write(&mut w).unwrap();
+                read_t.write(&mut w).unwrap();
             }
             Err(e) => {
                 eprintln!("failed to open histogram file for writing: {:?}", e);
@@ -198,56 +175,61 @@ where
         }
     }
 
-    println!(
-        "write\t50\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.5),
-        rmt_w_t.value_at_quantile(0.5)
-    );
-    println!(
-        "read\t50\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.5),
-        rmt_r_t.value_at_quantile(0.5)
-    );
-    println!(
-        "write\t95\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.95),
-        rmt_w_t.value_at_quantile(0.95)
-    );
-    println!(
-        "read\t95\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.95),
-        rmt_r_t.value_at_quantile(0.95)
-    );
-    println!(
-        "write\t99\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.99),
-        rmt_w_t.value_at_quantile(0.99)
-    );
-    println!(
-        "read\t99\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.99),
-        rmt_r_t.value_at_quantile(0.99)
-    );
-    println!(
-        "write\t100\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.max(),
-        rmt_w_t.max()
-    );
-    println!(
-        "read\t100\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.max(),
-        rmt_r_t.max()
-    );
+    // these may be None for priming, or otherwise very short runtime
+    if let Some((rmt_w_t, sjrn_w_t)) = write_t.last() {
+        println!(
+            "write\t50\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_w_t.value_at_quantile(0.5),
+            rmt_w_t.value_at_quantile(0.5)
+        );
+        println!(
+            "write\t95\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_w_t.value_at_quantile(0.95),
+            rmt_w_t.value_at_quantile(0.95)
+        );
+        println!(
+            "write\t99\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_w_t.value_at_quantile(0.99),
+            rmt_w_t.value_at_quantile(0.99)
+        );
+        println!(
+            "write\t100\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_w_t.max(),
+            rmt_w_t.max()
+        );
+    }
+    if let Some((rmt_r_t, sjrn_r_t)) = read_t.last() {
+        println!(
+            "read\t50\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_r_t.value_at_quantile(0.5),
+            rmt_r_t.value_at_quantile(0.5)
+        );
+        println!(
+            "read\t95\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_r_t.value_at_quantile(0.95),
+            rmt_r_t.value_at_quantile(0.95)
+        );
+        println!(
+            "read\t99\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_r_t.value_at_quantile(0.99),
+            rmt_r_t.value_at_quantile(0.99)
+        );
+        println!(
+            "read\t100\t{:.2}\t{:.2}\t(all µs)",
+            sjrn_r_t.max(),
+            rmt_r_t.max()
+        );
+    }
 }
 
 fn run_generator<C, R>(
-    handle: C,
+    mut handle: C,
     errd: &'static atomic::AtomicBool,
     ex: tokio::runtime::Handle,
     id_rng: R,
     target: f64,
     global_args: clap::ArgMatches,
-) -> (f64, f64)
+) -> (f64, f64, time::Duration)
 where
     C: VoteClient + Unpin + 'static,
     R: rand::distributions::Distribution<usize>,
@@ -258,31 +240,30 @@ where
     <C as Service<WriteRequest>>::Future: Send,
     <C as Service<WriteRequest>>::Response: Send,
 {
-    let early_exit = !global_args.is_present("no-early-exit");
     let runtime = time::Duration::from_secs(value_t_or_exit!(global_args, "runtime", u64));
-    let warmup = time::Duration::from_secs(value_t_or_exit!(global_args, "warmup", u64));
-
-    let start = time::Instant::now();
-    let end = start + warmup + runtime;
-
-    let max_batch_time = time::Duration::new(0, MAX_BATCH_TIME_US * 1_000);
-    let interarrival = Exp::new(target * 1e-9).unwrap();
-
     let every = value_t_or_exit!(global_args, "ratio", u32);
 
+    let interarrival = Exp::new(target * 1e-9).unwrap();
+    let mut next = time::Instant::now();
+
+    // each of these is a VecDeque<(Vec<key>, Vec<time>)>, where each inner Vec is a batch
+    // we separate time and keys so that we can pass the keys to the op without a memcpy
+    let mut queued_w = VecDeque::new();
+    let mut queued_r = VecDeque::new();
     let mut ops = 0;
 
-    let first = time::Instant::now();
-    let mut next = time::Instant::now();
-    let mut next_send = None;
-
-    let mut queued_w = Vec::new();
-    let mut queued_w_keys = Vec::new();
-    let mut queued_r = Vec::new();
-    let mut queued_r_keys = Vec::new();
+    // keep track of how large batches are growing so we can generally allocate just once for each
+    let mut w_capacity = 128;
+    let mut r_capacity = 128;
 
     let mut rng = rand::thread_rng();
-    let mut handle = tokio_test::task::spawn(handle);
+    let mut rt = tokio::runtime::Builder::new()
+        .basic_scheduler()
+        .build()
+        .unwrap();
+
+    let start = time::Instant::now();
+    let end = start + runtime;
 
     // we *could* use a rayon::scope here to safely access stack variables from inside each job,
     // but that would *also* force us to place the load generators *on* the thread pool (because of
@@ -300,214 +281,228 @@ where
     // when https://github.com/rust-lang/rust/issues/56556 is fixed, take &[i32] instead, make
     // Request hold &'a [i32] (then need for<'a> C: Service<Request<'a>>). then we no longer need
     // .split_off in calls to enqueue.
-    let enqueue =
-        move |client: &mut tokio_test::task::Spawn<C>, queued: Vec<_>, mut keys: Vec<_>, write| {
-            let n = keys.len();
-            let sent = time::Instant::now();
-            let fut = if write {
-                nwrite.fetch_add(1, atomic::Ordering::AcqRel);
-                Either::Left(
-                    client
-                        .call(WriteRequest(keys))
-                        .map(|r| r.context("failed to handle writes")),
-                )
+    let enqueue = move |client: &mut C,
+                        queued: Vec<_>,
+                        mut keys: Vec<_>,
+                        write,
+                        wait: Option<&mut FuturesUnordered<_>>| {
+        let n = keys.len();
+        let sent = time::Instant::now();
+        let fut = if write {
+            nwrite.fetch_add(n, atomic::Ordering::AcqRel);
+            Either::Left(
+                client
+                    .call(WriteRequest(keys))
+                    .map(|r| r.context("failed to handle writes")),
+            )
+        } else {
+            nread.fetch_add(n, atomic::Ordering::AcqRel);
+            // deduplicate requested keys, because not doing so would be silly
+            keys.sort_unstable();
+            keys.dedup();
+            Either::Right(
+                client
+                    .call(ReadRequest(keys))
+                    .map(|r| r.context("failed to handle reads")),
+            )
+        }
+        .map_ok(move |_| {
+            let done = time::Instant::now();
+            ndone.fetch_add(n, atomic::Ordering::AcqRel);
+            if write {
+                nwrite.fetch_sub(n, atomic::Ordering::AcqRel);
             } else {
-                nread.fetch_add(1, atomic::Ordering::AcqRel);
-                // deduplicate requested keys, because not doing so would be silly
-                keys.sort_unstable();
-                keys.dedup();
-                Either::Right(
-                    client
-                        .call(ReadRequest(keys))
-                        .map(|r| r.context("failed to handle reads")),
-                )
+                nread.fetch_sub(n, atomic::Ordering::AcqRel);
             }
-            .map_ok(move |_| {
-                let done = time::Instant::now();
-                ndone.fetch_add(n, atomic::Ordering::AcqRel);
-                if write {
-                    nwrite.fetch_sub(1, atomic::Ordering::AcqRel);
-                } else {
-                    nread.fetch_sub(1, atomic::Ordering::AcqRel);
-                }
 
-                if sent.duration_since(start) > warmup {
-                    let remote_t = done.duration_since(sent);
-                    let rmt = if write { &RMT_W } else { &RMT_R };
+            TIMING.with(|timing| {
+                let mut timing = timing.borrow_mut();
+                let timing = &mut *timing;
+                let timing = if write { &mut timing.0 } else { &mut timing.1 };
+                let hist = timing.histogram_for(sent.duration_since(start));
+
+                let remote_t = done.duration_since(sent);
+                let us =
+                    remote_t.as_secs() * 1_000_000 + u64::from(remote_t.subsec_nanos()) / 1_000;
+                hist.processing(us);
+
+                for started in queued {
+                    let sjrn_t = done.duration_since(started);
                     let us =
-                        remote_t.as_secs() * 1_000_000 + u64::from(remote_t.subsec_nanos()) / 1_000;
-                    rmt.with(|h| {
-                        let mut h = h.borrow_mut();
-                        if h.record(us).is_err() {
-                            let m = h.high();
-                            h.record(m).unwrap();
-                        }
-                    });
-
-                    let sjrn = if write { &SJRN_W } else { &SJRN_R };
-                    for started in queued {
-                        let sjrn_t = done.duration_since(started);
-                        let us =
-                            sjrn_t.as_secs() * 1_000_000 + u64::from(sjrn_t.subsec_nanos()) / 1_000;
-                        sjrn.with(|h| {
-                            let mut h = h.borrow_mut();
-                            if h.record(us).is_err() {
-                                let m = h.high();
-                                h.record(m).unwrap();
-                            }
-                        });
-                    }
+                        sjrn_t.as_secs() * 1_000_000 + u64::from(sjrn_t.subsec_nanos()) / 1_000;
+                    hist.sojourn(us);
                 }
-            });
+            })
+        });
 
-            ex.spawn(async move {
-                if let Err(e) = fut.await {
-                    if time::Instant::now() < (end - time::Duration::from_secs(1))
-                        && !errd.swap(true, atomic::Ordering::SeqCst)
-                    {
-                        eprintln!("failed to enqueue request: {:?}", e)
-                    }
+        let th = ex.spawn(async move {
+            if let Err(e) = fut.await {
+                if time::Instant::now() < (end - time::Duration::from_secs(1))
+                    && !errd.swap(true, atomic::Ordering::SeqCst)
+                {
+                    eprintln!("failed to enqueue request: {:?}", e)
                 }
-            });
-        };
+            }
+        });
+        if let Some(wait) = wait {
+            wait.push(th);
+        }
+    };
 
-    let mut worker_ops = None;
-    'outer: while next < end {
+    'gen: while next < end {
         let now = time::Instant::now();
+        // only queue a new request if we're told to. if this is not the case, we've
+        // just been woken up so we can realize we need to send a batch
         // NOTE: while, not if, in case we start falling behind
         while next <= now {
-            // only queue a new request if we're told to. if this is not the case, we've
-            // just been woken up so we can realize we need to send a batch
             let id = id_rng.sample(&mut rng) as i32;
-            if rng.gen_bool(1.0 / f64::from(every)) {
-                if queued_w.is_empty() && next_send.is_none() {
-                    next_send = Some(next + max_batch_time);
-                }
-                queued_w_keys.push(id);
-                queued_w.push(next);
+            let (batches, cap_hint, read) = if rng.gen_bool(1.0 / f64::from(every)) {
+                (&mut queued_w, &mut w_capacity, false)
             } else {
-                if queued_r.is_empty() && next_send.is_none() {
-                    next_send = Some(next + max_batch_time);
-                }
-                queued_r_keys.push(id);
-                queued_r.push(next);
+                (&mut queued_r, &mut r_capacity, true)
+            };
+
+            if batches.is_empty() {
+                // there is no pending batch, so start one
+                batches.push_back((Vec::with_capacity(*cap_hint), Vec::with_capacity(*cap_hint)));
+            }
+
+            if batches.len() > 1_000
+                && now - batches.front().unwrap().1[0] > time::Duration::from_secs(60)
+            {
+                // we're falling behind by _a lot_. if we keep running, we may even run out of
+                // memory from the infinite queueing we're doing, if load is high enough.
+                // to mitigate that, we're going to terminate early.
+                eprintln!(
+                    "# fell too far behind -- {:?} worth of {} pending in {} batches",
+                    now - batches.front().unwrap().1[0],
+                    if read { "reads" } else { "writes" },
+                    batches.len(),
+                );
+                break 'gen;
+            }
+
+            let (keys, times) = batches.back_mut().expect("push if is_empty");
+            keys.push(id);
+            times.push(next);
+
+            if next - times[0] >= MAX_BATCH_TIME {
+                // no more operations should be added to this batch, so start a new one.
+                // keep track of our largest batch size to avoid allocations later.
+                *cap_hint = (*cap_hint).max(keys.len());
+                batches.push_back((Vec::with_capacity(*cap_hint), Vec::with_capacity(*cap_hint)));
             }
 
             // schedule next delivery
             next += time::Duration::new(0, interarrival.sample(&mut rng) as u32);
         }
 
-        // in case that took a while:
-        let now = time::Instant::now();
+        // try to send batches
+        if !queued_w.is_empty() {
+            if let Poll::Ready(r) = rt.block_on(async {
+                futures_util::poll!(futures_util::future::poll_fn(|cx| {
+                    Service::<WriteRequest>::poll_ready(&mut handle, cx)
+                }))
+            }) {
+                r.unwrap();
+                let (keys, times) = queued_w.pop_front().expect("!is_empty");
+                ops += keys.len();
+                enqueue(&mut handle, times, keys, true, None);
+            } else {
+                // we can't send the request yet -- keep generating batches
+            }
+        }
 
-        if let Some(f) = next_send {
-            if f <= now {
-                // time to send at least one batch
-                if !queued_w.is_empty() && now.duration_since(queued_w[0]) >= max_batch_time {
-                    if let Poll::Ready(r) = handle.enter(|cx, mut handle| {
-                        Service::<WriteRequest>::poll_ready(&mut *handle, cx)
-                    }) {
-                        r.unwrap();
-                        ops += queued_w.len();
-                        enqueue(
-                            &mut handle,
-                            queued_w.split_off(0),
-                            queued_w_keys.split_off(0),
-                            true,
-                        );
-                    } else {
-                        // we can't send the request yet -- generate a larger batch
-                    }
-                }
-
-                if !queued_r.is_empty() && now.duration_since(queued_r[0]) >= max_batch_time {
-                    if let Poll::Ready(r) = handle.enter(|cx, mut handle| {
-                        Service::<ReadRequest>::poll_ready(&mut *handle, cx)
-                    }) {
-                        r.unwrap();
-                        ops += queued_r.len();
-                        enqueue(
-                            &mut handle,
-                            queued_r.split_off(0),
-                            queued_r_keys.split_off(0),
-                            false,
-                        );
-                    } else {
-                        // we can't send the request yet -- generate a larger batch
-                    }
-                }
-
-                // since next_send = Some, we better have sent at least one batch!
-                // if not, the service must have not been ready, so we just continue
-                if !queued_r.is_empty() && !queued_w.is_empty() {
-                    continue 'outer;
-                }
-
-                next_send = None;
-                if let Some(&qw) = queued_w.get(0) {
-                    next_send = Some(qw + max_batch_time);
-                }
-                if let Some(&qr) = queued_r.get(0) {
-                    next_send = Some(qr + max_batch_time);
-                }
-
-                // if the clients aren't keeping up, we want to make sure that we'll still
-                // finish around the stipulated end time. we unfortunately can't rely on just
-                // dropping the thread pool (https://github.com/rayon-rs/rayon/issues/544), so
-                // we instead need to stop issuing requests earlier than we otherwise would
-                // have. but make sure we're not still in the warmup phase, because the clients
-                // *could* speed up
-                if now.duration_since(start) > warmup {
-                    if worker_ops.is_none() {
-                        worker_ops =
-                            Some((time::Instant::now(), ndone.load(atomic::Ordering::Acquire)));
-                    }
-
-                    if early_exit && now < end {
-                        let clients_completed = ndone.load(atomic::Ordering::Acquire) as u64;
-                        let queued = ops as u64 - clients_completed;
-                        let dur = first.elapsed().as_secs();
-
-                        if dur > 0 {
-                            let client_rate = clients_completed / dur;
-                            if client_rate > 0 {
-                                let client_work_left = queued / client_rate;
-                                if client_work_left > (end - now).as_secs() + 1 {
-                                    // no point in continuing to feed work to the clients
-                                    // they have enough work to keep them busy until the end
-                                    eprintln!(
-                                    "load generator quitting early as clients are falling behind"
-                                );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        if !queued_r.is_empty() {
+            if let Poll::Ready(r) = rt.block_on(async {
+                futures_util::poll!(futures_util::future::poll_fn(|cx| {
+                    Service::<ReadRequest>::poll_ready(&mut handle, cx)
+                }))
+            }) {
+                r.unwrap();
+                let (keys, times) = queued_r.pop_front().expect("!is_empty");
+                ops += keys.len();
+                enqueue(&mut handle, times, keys, false, None);
+            } else {
+                // we can't send the request yet -- keep generating batches
             }
         }
 
         atomic::spin_loop_hint();
     }
 
-    let gen = throughput(ops, start.elapsed());
-    let worker_ops = worker_ops.map(|(measured, start)| {
-        throughput(
-            ndone.load(atomic::Ordering::Acquire) - start,
-            measured.elapsed(),
-        )
-    });
+    // we're done _generating_ requests, so we can measure generation throughput
+    let took = start.elapsed();
+    let gen = throughput(ops, took);
 
-    println!(
-        "pending at exit: {} writes, {} reads",
+    eprintln!(
+        "# missing after main run: {} writes, {} reads",
         nwrite.load(atomic::Ordering::Acquire),
         nread.load(atomic::Ordering::Acquire)
     );
 
+    // force the client to also complete their queue
+    rt.block_on(async {
+        // both poll_ready calls need &mut C, so the borrow checker will get mad. but since we're
+        // single-threaded, we know that only one mutable borrow happens _at a time_, so a RefCell
+        // takes care of that.
+        let handle = std::cell::RefCell::new(&mut handle);
+        let wait = std::cell::RefCell::new(FuturesUnordered::new());
+        while !queued_r.is_empty() || !queued_w.is_empty() {
+            tokio::select! {
+                r = futures_util::future::poll_fn(|cx| {
+                    Service::<WriteRequest>::poll_ready(&mut *handle.borrow_mut(), cx)
+                }), if !queued_w.is_empty() => {
+                    r.unwrap();
+                    let (keys, times) = queued_w.pop_front().expect("!is_empty");
+                    ops += keys.len();
+                    enqueue(
+                        &mut *handle.borrow_mut(),
+                        times,
+                        keys,
+                        true,
+                        Some(&mut *wait.borrow_mut()),
+                    );
+                }
+                r = futures_util::future::poll_fn(|cx| {
+                    Service::<ReadRequest>::poll_ready(&mut *handle.borrow_mut(), cx)
+                }), if !queued_r.is_empty() => {
+                    r.unwrap();
+                    let (keys, times) = queued_r.pop_front().expect("!is_empty");
+                    ops += keys.len();
+                    enqueue(
+                        &mut *handle.borrow_mut(),
+                        times,
+                        keys,
+                        false,
+                        Some(&mut *wait.borrow_mut()),
+                    );
+                }
+            };
+        }
+        let mut wait = wait.into_inner();
+        while !wait.is_empty() {
+            let _ = wait.next().await;
+        }
+    });
+    // there _may_ be batches that were enqueued before the loop before (and therefore weren't in
+    // `wait`), and that are still pending. we have little choice but to spin to wait for them,
+    // since we have no wait to track their progress or completion beyond polling.
+    while nwrite.load(atomic::Ordering::Acquire) != 0 {
+        std::thread::yield_now();
+    }
+    while nread.load(atomic::Ordering::Acquire) != 0 {
+        std::thread::yield_now();
+    }
+
+    // only now is it acceptable to measure _achieved_ throughput
+    let took = start.elapsed();
+    let worker_ops = throughput(ndone.load(atomic::Ordering::Acquire), took);
+
     // need to drop the pool before waiting so that workers will exit
     // and thus hit the barrier
     drop(handle);
-    (gen, worker_ops.unwrap_or(0.0))
+    (gen, worker_ops, took)
 }
 
 fn main() {
@@ -525,27 +520,12 @@ fn main() {
                 .help("Number of articles to prepopulate the database with"),
         )
         .arg(
-            Arg::with_name("threads")
-                .short("t")
-                .long("threads")
-                .value_name("N")
-                .default_value("4")
-                .help("Number of client load threads to run"),
-        )
-        .arg(
             Arg::with_name("runtime")
                 .short("r")
                 .long("runtime")
                 .value_name("N")
                 .default_value("30")
                 .help("Benchmark runtime in seconds"),
-        )
-        .arg(
-            Arg::with_name("warmup")
-                .long("warmup")
-                .takes_value(true)
-                .default_value("10")
-                .help("Warmup time in seconds"),
         )
         .arg(
             Arg::with_name("distribution")
@@ -583,11 +563,6 @@ fn main() {
                 .long("no-prime")
                 .help("Indicates that the client should not set up the database"),
         )
-        .arg(
-            Arg::with_name("no-early-exit")
-                .long("no-early-exit")
-                .help("Don't stop generating load when clients fall behind."),
-        )
         .subcommand(
             SubCommand::with_name("netsoup")
                 .arg(
@@ -622,6 +597,17 @@ fn main() {
                         .long("fast")
                         .help("Only fetch vote counts, not titles."),
                 ),
+        )
+        .subcommand(
+            SubCommand::with_name("redis")
+                .arg(
+                    Arg::with_name("address")
+                        .long("address")
+                        .takes_value(true)
+                        .required(true)
+                        .default_value("127.0.0.1")
+                        .help("Address of redis server"),
+                )
         )
         .subcommand(
             SubCommand::with_name("mssql")
@@ -768,6 +754,7 @@ fn main() {
         ("memcached", Some(largs)) => run::<clients::memcached::Conn>(&args, largs),
         //("mssql", Some(largs)) => run::<clients::mssql::Conf>(&args, largs),
         ("mysql", Some(largs)) => run::<clients::mysql::Conn>(&args, largs),
+        ("redis", Some(largs)) => run::<clients::redis::Conn>(&args, largs),
         //("hybrid", Some(largs)) => run::<clients::hybrid::Conf>(&args, largs),
         //("null", Some(largs)) => run::<()>(&args, largs),
         (name, _) => eprintln!("unrecognized backend type '{}'", name),

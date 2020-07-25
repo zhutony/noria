@@ -9,7 +9,7 @@ use bufstream::BufStream;
 use byteorder::{NetworkEndian, WriteBytesExt};
 use futures_util::ready;
 use futures_util::{sink::Sink, stream::Stream};
-use pin_project::{pin_project, project};
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
     pin::Pin,
@@ -69,12 +69,20 @@ impl<T: Serialize> TcpSender<T> {
     }
 
     pub(crate) fn connect_from(sport: Option<u16>, addr: &SocketAddr) -> Result<Self, io::Error> {
-        let s = net2::TcpBuilder::new_v4()?
-            .reuse_address(true)?
-            .bind((Ipv4Addr::UNSPECIFIED, sport.unwrap_or(0)))?
-            .connect(addr)?;
-        s.set_nodelay(true)?;
-        Self::new(s)
+        let f = move || {
+            let s = net2::TcpBuilder::new_v4()?
+                .reuse_address(true)?
+                .bind((Ipv4Addr::UNSPECIFIED, sport.unwrap_or(0)))?
+                .connect(addr)?;
+            s.set_nodelay(true)?;
+            Self::new(s)
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
+        }
     }
 
     pub fn connect(addr: &SocketAddr) -> Result<Self, io::Error> {
@@ -108,11 +116,19 @@ impl<T: Serialize> TcpSender<T> {
             return Err(SendError::Poisoned);
         }
 
-        let size = u32::try_from(bincode::serialized_size(t).unwrap()).unwrap();
-        poisoning_try!(self, self.stream.write_u32::<NetworkEndian>(size));
-        poisoning_try!(self, bincode::serialize_into(&mut self.stream, t));
-        poisoning_try!(self, self.stream.flush());
-        Ok(())
+        let mut f = move || {
+            let size = u32::try_from(bincode::serialized_size(t).unwrap()).unwrap();
+            poisoning_try!(self, self.stream.write_u32::<NetworkEndian>(size));
+            poisoning_try!(self, bincode::serialize_into(&mut self.stream, t));
+            poisoning_try!(self, self.stream.flush());
+            Ok(())
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
+        }
     }
 
     pub fn reader<'a>(&'a mut self) -> impl io::Read + 'a {
@@ -140,7 +156,7 @@ pub enum RecvError {
     DeserializationError(bincode::Error),
 }
 
-#[pin_project]
+#[pin_project(project = DualTcpStreamProj)]
 pub enum DualTcpStream<S, T, T2, D> {
     Passthrough(#[pin] AsyncBincodeStream<S, T, Tagged<()>, D>),
     Upgrade(
@@ -178,39 +194,31 @@ where
 {
     type Error = bincode::Error;
 
-    #[project]
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        #[project]
         match self.project() {
-            DualTcpStream::Passthrough(abs) => abs.poll_ready(cx),
-            DualTcpStream::Upgrade(abs, _) => abs.poll_ready(cx),
+            DualTcpStreamProj::Passthrough(abs) => abs.poll_ready(cx),
+            DualTcpStreamProj::Upgrade(abs, _) => abs.poll_ready(cx),
         }
     }
 
-    #[project]
     fn start_send(self: Pin<&mut Self>, item: Tagged<()>) -> Result<(), Self::Error> {
-        #[project]
         match self.project() {
-            DualTcpStream::Passthrough(abs) => abs.start_send(item),
-            DualTcpStream::Upgrade(abs, _) => abs.start_send(item),
+            DualTcpStreamProj::Passthrough(abs) => abs.start_send(item),
+            DualTcpStreamProj::Upgrade(abs, _) => abs.start_send(item),
         }
     }
 
-    #[project]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        #[project]
         match self.project() {
-            DualTcpStream::Passthrough(abs) => abs.poll_flush(cx),
-            DualTcpStream::Upgrade(abs, _) => abs.poll_flush(cx),
+            DualTcpStreamProj::Passthrough(abs) => abs.poll_flush(cx),
+            DualTcpStreamProj::Upgrade(abs, _) => abs.poll_flush(cx),
         }
     }
 
-    #[project]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        #[project]
         match self.project() {
-            DualTcpStream::Passthrough(abs) => abs.poll_close(cx),
-            DualTcpStream::Upgrade(abs, _) => abs.poll_close(cx),
+            DualTcpStreamProj::Passthrough(abs) => abs.poll_close(cx),
+            DualTcpStreamProj::Upgrade(abs, _) => abs.poll_close(cx),
         }
     }
 }
@@ -225,14 +233,12 @@ where
 {
     type Item = Result<T, bincode::Error>;
 
-    #[project]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // https://github.com/rust-lang/rust-clippy/issues/3071
-        #[project]
         #[allow(clippy::redundant_closure)]
         match self.project() {
-            DualTcpStream::Passthrough(abr) => abr.poll_next(cx),
-            DualTcpStream::Upgrade(abr, upgrade) => {
+            DualTcpStreamProj::Passthrough(abr) => abr.poll_next(cx),
+            DualTcpStreamProj::Upgrade(abr, upgrade) => {
                 Poll::Ready(ready!(abr.poll_next(cx)).transpose()?.map(upgrade).map(Ok))
             }
         }

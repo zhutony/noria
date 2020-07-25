@@ -18,8 +18,9 @@ use std::task::{Context, Poll};
 use std::{fmt, io};
 use tokio::io::AsyncWriteExt;
 use tokio_tower::multiplex;
-use tower_balance::pool::{self, Pool};
+use tower_balance::p2c::Balance;
 use tower_buffer::Buffer;
+use tower_discover::ServiceStream;
 use tower_limit::concurrency::ConcurrencyLimit;
 use tower_service::Service;
 use vec_map::VecMap;
@@ -201,23 +202,22 @@ async fn update_user(users: &mut Table) -> Result<(), TableError> {
 }
 
 #[derive(Debug)]
-#[doc(hidden)]
-// only pub because we use it to figure out the error type for TableError
-pub struct TableEndpoint(SocketAddr);
+struct Endpoint(SocketAddr);
 
-impl Service<()> for TableEndpoint {
-    type Response = ConcurrencyLimit<
-        multiplex::Client<
-            multiplex::MultiplexTransport<Transport, Tagger>,
-            tokio_tower::Error<
-                multiplex::MultiplexTransport<Transport, Tagger>,
-                Tagged<LocalOrNot<Input>>,
-            >,
-            Tagged<LocalOrNot<Input>>,
-        >,
-    >;
+type InnerService = multiplex::Client<
+    multiplex::MultiplexTransport<Transport, Tagger>,
+    tokio_tower::Error<multiplex::MultiplexTransport<Transport, Tagger>, Tagged<LocalOrNot<Input>>>,
+    Tagged<LocalOrNot<Input>>,
+>;
+
+impl Service<()> for Endpoint {
+    type Response = InnerService;
     type Error = tokio::io::Error;
+
+    #[cfg(not(doc))]
     type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+    #[cfg(doc)]
+    type Future = crate::doc_mock::Future<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -232,19 +232,47 @@ impl Service<()> for TableEndpoint {
             s.flush().await.unwrap();
             let s = AsyncBincodeStream::from(s).for_async();
             let t = multiplex::MultiplexTransport::new(s, Tagger::default());
-            // NOTE: we need to limit concurrency since AsyncBincode does unlimited buffering
-            Ok(ConcurrencyLimit::new(
-                multiplex::Client::with_error_handler(t, |e| panic!("{:?}", e)),
-                crate::PENDING_PER_CONN,
-            ))
+            Ok(multiplex::Client::with_error_handler(t, |e| {
+                eprintln!("table server went away: {}", e)
+            }))
         }
     }
 }
 
-pub(crate) type TableRpc =
-    Buffer<Pool<TableEndpoint, (), Tagged<LocalOrNot<Input>>>, Tagged<LocalOrNot<Input>>>;
+fn make_table_stream(
+    addr: SocketAddr,
+) -> impl futures_util::stream::TryStream<
+    Ok = tower_discover::Change<usize, InnerService>,
+    Error = tokio::io::Error,
+> {
+    // TODO: use whatever comes out of https://github.com/tower-rs/tower/issues/456 instead of
+    // creating _all_ the connections every time.
+    (0..crate::TABLE_POOL_SIZE)
+        .map(|i| async move {
+            let svc = Endpoint(addr).call(()).await?;
+            Ok(tower_discover::Change::Insert(i, svc))
+        })
+        .collect::<futures_util::stream::FuturesUnordered<_>>()
+}
 
-/// A failed [`SyncTable`] operation.
+fn make_table_discover(addr: SocketAddr) -> Discover {
+    ServiceStream::new(make_table_stream(addr))
+}
+
+// Unpin + Send bounds are needed due to https://github.com/rust-lang/rust/issues/55997
+#[cfg(not(doc))]
+type Discover = impl tower_discover::Discover<Key = usize, Service = InnerService, Error = tokio::io::Error>
+    + Unpin
+    + Send;
+#[cfg(doc)]
+type Discover = crate::doc_mock::Discover<InnerService>;
+
+pub(crate) type TableRpc = Buffer<
+    ConcurrencyLimit<Balance<Discover, Tagged<LocalOrNot<Input>>>>,
+    Tagged<LocalOrNot<Input>>,
+>;
+
+/// A failed [`Table`] operation.
 #[derive(Debug, Fail)]
 pub enum TableError {
     /// The wrong number of columns was given when inserting a row.
@@ -323,12 +351,10 @@ impl TableBuilder {
                 Entry::Vacant(h) => {
                     // TODO: maybe always use the same local port?
                     let (c, w) = Buffer::pair(
-                        pool::Builder::new()
-                            .urgency(0.01)
-                            .loaded_above(0.2)
-                            .underutilized_below(0.000_000_001)
-                            .max_services(Some(crate::MAX_POOL_SIZE))
-                            .build(TableEndpoint(addr), ()),
+                        ConcurrencyLimit::new(
+                            Balance::from_entropy(make_table_discover(addr)),
+                            crate::PENDING_LIMIT,
+                        ),
                         crate::BUFFER_TO_POOL,
                     );
                     use tracing_futures::Instrument;
@@ -558,7 +584,11 @@ impl Table {
 impl Service<Vec<TableOperation>> for Table {
     type Error = TableError;
     type Response = <TableRpc as Service<Tagged<LocalOrNot<Input>>>>::Response;
+
+    #[cfg(not(doc))]
     type Future = impl Future<Output = Result<Tagged<()>, TableError>> + Send;
+    #[cfg(doc)]
+    type Future = crate::doc_mock::Future<Result<Tagged<()>, TableError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         for s in &mut self.shards {

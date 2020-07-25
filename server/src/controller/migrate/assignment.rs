@@ -23,10 +23,22 @@ pub fn assign(log: &Logger, graph: &mut Graph, topo_list: &[NodeIndex], ndomains
             let graph = &*graph;
             let n = &graph[node];
 
+            // TODO: the code below is probably _too_ good at keeping things in one domain.
+            // having all bases in one domain (e.g., if sharding is disabled) isn't great because
+            // write performance will suffer terribly.
+
             if n.is_shard_merger() {
                 // shard mergers are always in their own domain.
                 // we *could* use the same domain for multiple separate shard mergers
                 // but it's unlikely that would do us any good.
+                return next_domain();
+            }
+
+            if n.is_reader() {
+                // readers always re-materialize, so sharing a domain doesn't help them much.
+                // having them in their own domain also means that they get to aggregate reader
+                // replay requests in their own little thread, and not interfere as much with other
+                // internal traffic.
                 return next_domain();
             }
 

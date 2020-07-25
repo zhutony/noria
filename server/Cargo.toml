@@ -1,6 +1,6 @@
 [package]
 name = "noria-server"
-version = "0.4.0"
+version = "0.7.0"
 edition = "2018"
 authors = ["The Noria developers <noria@pdos.csail.mit.edu>"]
 license = "MIT OR Apache-2.0"
@@ -25,7 +25,7 @@ generate_mysql_tests = ["default"]
 [dependencies]
 clap = "2.25.0"
 failure = "0.1.1"
-fnv = "1.0.5"
+ahash = "0.3"
 futures-core = "0.3.0"
 futures-util = "0.3.0"
 futures-sink = "0.3.0"
@@ -43,27 +43,27 @@ slog = "2.4.0"
 slog-term = "2.4.0"
 async-timer = { version = "0.7.0", features = [ "stream", "tokio_on" ] }
 slab = "0.4"
-bincode = "1.0.0"
+bincode = "1.3.0"
 tokio = { version = "0.2.0", features = ["full"] }
 async-bincode = "0.5.0"
 tracing = "0.1"
 streamunordered = "0.5.0"
-stream-cancel = "0.5.1"
+stream-cancel = "0.6.1"
 
 timekeeper = { version = "0.3.2", default-features = false }
 vec_map = { version = "0.8.0", features = ["eders"] }
 serde = { version = "1.0.8", features = ["rc"] }
 zookeeper = "0.5.3"
-tokio-tower = "0.3.6"
+tokio-tower = "0.4"
 tower-util = "0.3.0"
 tower = "0.3.0"
 strawpoll = "0.2"
 
 # local deps
-dataflow = { version = "0.4.0", path = "dataflow", package = "noria-dataflow" }
-mir = { version = "0.4.0", path = "mir", package = "noria-mir" }
-common = { version = "0.4.0", path = "common", package = "noria-common" }
-noria = { version = "0.4.0", path = "../noria" }
+dataflow = { version = "0.7.0", path = "dataflow", package = "noria-dataflow" }
+mir = { version = "0.7.0", path = "mir", package = "noria-mir" }
+common = { version = "0.7.0", path = "common", package = "noria-common" }
+noria = { version = "0.7.0", path = "../noria" }
 
 [dev-dependencies]
 backtrace = { version = "0.3.2", features = ["serialize-serde"] }

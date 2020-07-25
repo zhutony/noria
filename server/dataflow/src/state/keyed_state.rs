@@ -1,4 +1,4 @@
-use fnv::FnvBuildHasher;
+use ahash::RandomState;
 use indexmap::IndexMap;
 use std::rc::Rc;
 
@@ -6,16 +6,16 @@ use super::mk_key::MakeKey;
 use crate::prelude::*;
 use common::SizeOf;
 
-type FnvHashMap<K, V> = IndexMap<K, V, FnvBuildHasher>;
+type HashMap<K, V> = IndexMap<K, V, RandomState>;
 
 #[allow(clippy::type_complexity)]
 pub(super) enum KeyedState {
-    Single(FnvHashMap<DataType, Rows>),
-    Double(FnvHashMap<(DataType, DataType), Rows>),
-    Tri(FnvHashMap<(DataType, DataType, DataType), Rows>),
-    Quad(FnvHashMap<(DataType, DataType, DataType, DataType), Rows>),
-    Quin(FnvHashMap<(DataType, DataType, DataType, DataType, DataType), Rows>),
-    Sex(FnvHashMap<(DataType, DataType, DataType, DataType, DataType, DataType), Rows>),
+    Single(HashMap<DataType, Rows>),
+    Double(HashMap<(DataType, DataType), Rows>),
+    Tri(HashMap<(DataType, DataType, DataType), Rows>),
+    Quad(HashMap<(DataType, DataType, DataType, DataType), Rows>),
+    Quin(HashMap<(DataType, DataType, DataType, DataType, DataType), Rows>),
+    Sex(HashMap<(DataType, DataType, DataType, DataType, DataType, DataType), Rows>),
 }
 
 impl KeyedState {
@@ -35,34 +35,38 @@ impl KeyedState {
     /// the number of bytes freed. Returns `None` if map is empty.
     pub(super) fn evict_with_seed(&mut self, seed: usize) -> Option<(u64, Vec<DataType>)> {
         let (rs, key) = match *self {
-            KeyedState::Single(ref mut m) => {
+            KeyedState::Single(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index).map(|(k, rs)| (rs, vec![k]))
             }
-            KeyedState::Double(ref mut m) => {
+            KeyedState::Double(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index)
                     .map(|(k, rs)| (rs, vec![k.0, k.1]))
             }
-            KeyedState::Tri(ref mut m) => {
+            KeyedState::Tri(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index)
                     .map(|(k, rs)| (rs, vec![k.0, k.1, k.2]))
             }
-            KeyedState::Quad(ref mut m) => {
+            KeyedState::Quad(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index)
                     .map(|(k, rs)| (rs, vec![k.0, k.1, k.2, k.3]))
             }
-            KeyedState::Quin(ref mut m) => {
+            KeyedState::Quin(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index)
                     .map(|(k, rs)| (rs, vec![k.0, k.1, k.2, k.3, k.4]))
             }
-            KeyedState::Sex(ref mut m) => {
+            KeyedState::Sex(ref mut m) if !m.is_empty() => {
                 let index = seed % m.len();
                 m.swap_remove_index(index)
                     .map(|(k, rs)| (rs, vec![k.0, k.1, k.2, k.3, k.4, k.5]))
+            }
+            _ => {
+                // map must be empty, so no point in trying to evict from it.
+                return None;
             }
         }?;
         Some((
@@ -108,12 +112,12 @@ impl<'a> Into<KeyedState> for &'a [usize] {
     fn into(self) -> KeyedState {
         match self.len() {
             0 => unreachable!(),
-            1 => KeyedState::Single(FnvHashMap::default()),
-            2 => KeyedState::Double(FnvHashMap::default()),
-            3 => KeyedState::Tri(FnvHashMap::default()),
-            4 => KeyedState::Quad(FnvHashMap::default()),
-            5 => KeyedState::Quin(FnvHashMap::default()),
-            6 => KeyedState::Sex(FnvHashMap::default()),
+            1 => KeyedState::Single(HashMap::default()),
+            2 => KeyedState::Double(HashMap::default()),
+            3 => KeyedState::Tri(HashMap::default()),
+            4 => KeyedState::Quad(HashMap::default()),
+            5 => KeyedState::Quin(HashMap::default()),
+            6 => KeyedState::Sex(HashMap::default()),
             x => panic!("invalid compound key of length: {}", x),
         }
     }

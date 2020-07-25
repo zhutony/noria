@@ -1,6 +1,6 @@
 use crate::prelude::*;
+use ahash::RandomState;
 use common::SizeOf;
-use fnv::FnvBuildHasher;
 use rand::prelude::*;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn new_inner(
             use evmap;
             let (r, w) = evmap::Options::default()
                 .with_meta(-1)
-                .with_hasher(FnvBuildHasher::default())
+                .with_hasher(RandomState::default())
                 .construct();
 
             (multir::Handle::$variant(r), multiw::Handle::$variant(w))
@@ -153,7 +153,7 @@ impl<'a> MutWriteHandleEntry<'a> {
 impl<'a> WriteHandleEntry<'a> {
     pub(crate) fn try_find_and<F, T>(self, mut then: F) -> Result<(Option<T>, i64), ()>
     where
-        F: FnMut(&evmap::Values<Vec<DataType>, fnv::FnvBuildHasher>) -> T,
+        F: FnMut(&evmap::Values<Vec<DataType>, RandomState>) -> T,
     {
         self.handle
             .handle
@@ -256,25 +256,24 @@ impl WriteHandle {
 
     /// Evict `count` randomly selected keys from state and return them along with the number of
     /// bytes that will be freed once the underlying `evmap` applies the operation.
-    pub(crate) fn evict_random_key(&mut self, rng: &mut ThreadRng) -> u64 {
+    pub(crate) fn evict_random_keys(&mut self, rng: &mut ThreadRng, mut n: usize) -> u64 {
         let mut bytes_to_be_freed = 0;
         if self.mem_size > 0 {
             if self.handle.is_empty() {
                 unreachable!("mem size is {}, but map is empty", self.mem_size);
             }
 
-            match self.handle.empty_at_index(rng.gen()) {
-                None => (),
-                Some(vs) => {
-                    let size: u64 = vs.iter().map(|r| r.deep_size_of() as u64).sum();
-                    bytes_to_be_freed += size;
-                }
-            }
-            self.mem_size = self
-                .mem_size
-                .checked_sub(bytes_to_be_freed as usize)
-                .unwrap();
+            self.handle.empty_random_for_each(rng, n, |vs| {
+                let size: u64 = vs.iter().map(|r| r.deep_size_of() as u64).sum();
+                bytes_to_be_freed += size;
+                n -= 1;
+            });
         }
+
+        self.mem_size = self
+            .mem_size
+            .checked_sub(bytes_to_be_freed as usize)
+            .unwrap();
         bytes_to_be_freed
     }
 }
@@ -289,6 +288,10 @@ impl SizeOf for WriteHandle {
     fn deep_size_of(&self) -> u64 {
         self.mem_size as u64
     }
+
+    fn is_empty(&self) -> bool {
+        self.handle.is_empty()
+    }
 }
 
 /// Handle to get the state of a single shard of a reader.
@@ -297,6 +300,16 @@ pub struct SingleReadHandle {
     handle: multir::Handle,
     trigger: Option<Arc<dyn Fn(&mut dyn Iterator<Item = &[DataType]>) -> bool + Send + Sync>>,
     key: Vec<usize>,
+}
+
+impl std::fmt::Debug for SingleReadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleReadHandle")
+            .field("handle", &self.handle)
+            .field("has_trigger", &self.trigger.is_some())
+            .field("key", &self.key)
+            .finish()
+    }
 }
 
 impl SingleReadHandle {
@@ -326,7 +339,7 @@ impl SingleReadHandle {
     /// Holes in partially materialized state are returned as `Ok((None, _))`.
     pub fn try_find_and<F, T>(&self, key: &[DataType], mut then: F) -> Result<(Option<T>, i64), ()>
     where
-        F: FnMut(&evmap::Values<Vec<DataType>, fnv::FnvBuildHasher>) -> T,
+        F: FnMut(&evmap::Values<Vec<DataType>, RandomState>) -> T,
     {
         self.handle
             .meta_get_and(key, &mut then)
@@ -359,7 +372,7 @@ mod tests {
         let (r, mut w) = new(2, &[0]);
 
         // initially, store is uninitialized
-        assert_eq!(r.try_find_and(&a[0..1], |rs| rs.len()), Ok((Some(0), -1)));
+        assert_eq!(r.try_find_and(&a[0..1], |rs| rs.len()), Err(()));
 
         w.swap();
 

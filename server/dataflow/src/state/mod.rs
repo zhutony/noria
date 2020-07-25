@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::vec;
 
 use crate::prelude::*;
+use ahash::RandomState;
 use common::SizeOf;
 use hashbag::HashBag;
 
@@ -57,7 +58,7 @@ pub(crate) trait State: SizeOf + Send {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct Row(Rc<Vec<DataType>>);
 
-pub(crate) type Rows = HashBag<Row, fnv::FnvBuildHasher>;
+pub(crate) type Rows = HashBag<Row, RandomState>;
 
 unsafe impl Send for Row {}
 
@@ -93,11 +94,14 @@ impl SizeOf for Row {
     fn deep_size_of(&self) -> u64 {
         (*self.0).deep_size_of()
     }
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 /// An std::borrow::Cow-like wrapper around a collection of rows.
 pub(crate) enum RecordResult<'a> {
-    Borrowed(&'a HashBag<Row, fnv::FnvBuildHasher>),
+    Borrowed(&'a HashBag<Row, RandomState>),
     Owned(Vec<Vec<DataType>>),
 }
 

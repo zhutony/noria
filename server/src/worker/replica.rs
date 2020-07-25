@@ -3,6 +3,7 @@ const FORCE_INPUT_YIELD_EVERY: usize = 32;
 
 use super::ChannelCoordinator;
 use crate::coordination::CoordinationPayload;
+use ahash::{AHashMap, AHashSet};
 use async_bincode::AsyncDestination;
 use async_timer::Oneshot;
 use bincode;
@@ -11,8 +12,7 @@ use dataflow::{
     prelude::{DataType, Executor},
     Domain, Packet, PollEvent, ProcessResult,
 };
-use failure::{self, ResultExt};
-use fnv::{FnvHashMap, FnvHashSet};
+use failure::{self, Fail, ResultExt};
 use futures_util::{
     sink::Sink,
     stream::{futures_unordered::FuturesUnordered, Stream},
@@ -62,6 +62,9 @@ pub(super) struct Replica {
     retry: Option<Box<Packet>>,
 
     #[pin]
+    refresh_sizes: tokio::time::Interval,
+
+    #[pin]
     valve: Valve,
 
     #[pin]
@@ -82,7 +85,7 @@ pub(super) struct Replica {
         >,
     >,
 
-    outputs: FnvHashMap<
+    outputs: AHashMap<
         ReplicaAddr,
         (
             Box<dyn Sink<Box<Packet>, Error = bincode::Error> + Send + Unpin>,
@@ -125,6 +128,7 @@ impl Replica {
             timeout: Strawpoll::from(async_timer::oneshot::Timer::new(time::Duration::from_secs(
                 3600,
             ))),
+            refresh_sizes: tokio::time::interval(time::Duration::from_millis(500)),
             timed_out: false,
         }
     }
@@ -324,7 +328,7 @@ impl Replica {
         Ok(())
     }
 
-    fn try_new(self: Pin<&mut Self>, cx: &mut Context<'_>) -> io::Result<bool> {
+    fn try_new(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<bool, failure::Error> {
         let mut this = self.project();
 
         if let Poll::Ready(true) = this.valve.poll_closed(cx) {
@@ -333,7 +337,8 @@ impl Replica {
             while let Poll::Ready((stream, _)) = this
                 .incoming
                 .as_mut()
-                .poll_fn(cx, |mut i, cx| i.poll_accept(cx))?
+                .poll_fn(cx, |mut i, cx| i.poll_accept(cx))
+                .map_err(|e| e.context("poll_accept"))?
             {
                 // we know that any new connection to a domain will first send a one-byte
                 // token to indicate whether the connection is from a base or not.
@@ -342,7 +347,24 @@ impl Replica {
             }
         }
 
-        while let Poll::Ready(Some((stream, tag))) = this.first_byte.as_mut().poll_next(cx)? {
+        while let Poll::Ready(Some(r)) = this.first_byte.as_mut().poll_next(cx) {
+            let (stream, tag) = match r {
+                Ok((s, t)) => (s, t),
+                Err(e) => {
+                    if let io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset = e.kind()
+                    {
+                        // connection went away right after connecting,
+                        // let's not bother the user with it
+                        continue;
+                    }
+                    Err(e).context("poll_next")?;
+                    unreachable!();
+                }
+            };
             let is_base = tag == CONNECTION_FROM_BASE;
 
             debug!(this.log, "established new connection"; "base" => ?is_base);
@@ -402,10 +424,8 @@ impl Replica {
 
         if *this.timed_out {
             *this.timed_out = false;
-            tokio::task::block_in_place(|| {
-                this.domain.on_event(this.out, PollEvent::Timeout);
-                processed = true;
-            });
+            this.domain.on_event(this.out, PollEvent::Timeout);
+            processed = true;
         }
 
         processed
@@ -431,13 +451,13 @@ struct Outboxes {
     dirty: bool,
 
     // messages for other domains
-    domains: FnvHashMap<ReplicaAddr, VecDeque<Box<Packet>>>,
+    domains: AHashMap<ReplicaAddr, VecDeque<Box<Packet>>>,
 
     // connection state for each stream
     connections: slab::Slab<ConnState>,
 
     // which connections have pending writes
-    pending: FnvHashSet<usize>,
+    pending: AHashSet<usize>,
 
     // for sending messages to the controller
     ctrl_tx: tokio::sync::mpsc::UnboundedSender<CoordinationPayload>,
@@ -524,9 +544,7 @@ impl Future for Replica {
     type Output = Result<(), failure::Error>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         'process: loop {
-            // FIXME: check if we should call update_state_sizes (every evict_every)
-
-            // are there are any new connections?
+            // are there any new connections?
             if !self
                 .as_mut()
                 .try_new(cx)
@@ -564,11 +582,16 @@ impl Future for Replica {
             let d = this.domain;
             let out = this.out;
 
+            if let Poll::Ready(Some(_)) = this.refresh_sizes.poll_next(cx) {
+                // TODO: keep the state size up-to-date continuously?
+                d.update_state_sizes();
+            }
+
             macro_rules! process {
                 ($retry:expr, $outbox:expr, $p:expr, $pp:expr) => {{
                     $retry = Some($p);
                     let retry = &mut $retry;
-                    if let ProcessResult::StopPolling = tokio::task::block_in_place(|| {
+                    if let ProcessResult::StopPolling = {
                         let packet = retry.take().unwrap();
                         if let Packet::Input {
                             src: Some(SourceChannelIdentifier { token, epoch, .. }),
@@ -578,7 +601,7 @@ impl Future for Replica {
                             $outbox.saw_input(token, epoch);
                         }
                         $pp(packet)
-                    }) {
+                    } {
                         // domain got a message to quit
                         // TODO: should we finish up remaining work?
                         return Poll::Ready(Ok(()));

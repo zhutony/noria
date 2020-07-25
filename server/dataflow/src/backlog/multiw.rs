@@ -1,12 +1,12 @@
 use super::{key_to_double, key_to_single, Key};
 use crate::prelude::*;
+use ahash::RandomState;
 use evmap;
-use fnv::FnvBuildHasher;
 
 pub(super) enum Handle {
-    Single(evmap::WriteHandle<DataType, Vec<DataType>, i64, FnvBuildHasher>),
-    Double(evmap::WriteHandle<(DataType, DataType), Vec<DataType>, i64, FnvBuildHasher>),
-    Many(evmap::WriteHandle<Vec<DataType>, Vec<DataType>, i64, FnvBuildHasher>),
+    Single(evmap::WriteHandle<DataType, Vec<DataType>, i64, RandomState>),
+    Double(evmap::WriteHandle<(DataType, DataType), Vec<DataType>, i64, RandomState>),
+    Many(evmap::WriteHandle<Vec<DataType>, Vec<DataType>, i64, RandomState>),
 }
 
 impl Handle {
@@ -48,14 +48,16 @@ impl Handle {
 
     /// Evict `count` randomly selected keys from state and return them along with the number of
     /// bytes freed.
-    pub fn empty_at_index(
+    pub fn empty_random_for_each(
         &mut self,
-        index: usize,
-    ) -> Option<&evmap::Values<Vec<DataType>, fnv::FnvBuildHasher>> {
+        rng: &mut impl rand::Rng,
+        n: usize,
+        mut f: impl FnMut(&evmap::Values<Vec<DataType>, RandomState>),
+    ) {
         match *self {
-            Handle::Single(ref mut h) => h.empty_at_index(index).map(|r| r.1),
-            Handle::Double(ref mut h) => h.empty_at_index(index).map(|r| r.1),
-            Handle::Many(ref mut h) => h.empty_at_index(index).map(|r| r.1),
+            Handle::Single(ref mut h) => h.empty_random(rng, n).for_each(|r| f(r.1)),
+            Handle::Double(ref mut h) => h.empty_random(rng, n).for_each(|r| f(r.1)),
+            Handle::Many(ref mut h) => h.empty_random(rng, n).for_each(|r| f(r.1)),
         }
     }
 
@@ -75,14 +77,15 @@ impl Handle {
 
     pub fn meta_get_and<F, T>(&self, key: Key, then: F) -> Option<(Option<T>, i64)>
     where
-        F: FnOnce(&evmap::Values<Vec<DataType>, fnv::FnvBuildHasher>) -> T,
+        F: FnOnce(&evmap::Values<Vec<DataType>, RandomState>) -> T,
     {
         match *self {
             Handle::Single(ref h) => {
                 assert_eq!(key.len(), 1);
-                let map = h.read();
+                let map = h.read()?;
                 let v = map.get(&key[0]).map(then);
-                map.meta().cloned().map(move |m| (v, m))
+                let m = *map.meta();
+                Some((v, m))
             }
             Handle::Double(ref h) => {
                 assert_eq!(key.len(), 2);
@@ -108,15 +111,17 @@ impl Handle {
                         1,
                     );
                     let stack_key = mem::transmute::<_, &(DataType, DataType)>(&stack_key);
-                    let map = h.read();
+                    let map = h.read()?;
                     let v = map.get(&stack_key).map(then);
-                    map.meta().cloned().map(move |m| (v, m))
+                    let m = *map.meta();
+                    Some((v, m))
                 }
             }
             Handle::Many(ref h) => {
-                let map = h.read();
+                let map = h.read()?;
                 let v = map.get(&key[..]).map(then);
-                map.meta().cloned().map(move |m| (v, m))
+                let m = *map.meta();
+                Some((v, m))
             }
         }
     }

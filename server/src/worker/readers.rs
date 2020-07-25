@@ -7,8 +7,7 @@ use futures_util::{
     future,
     future::Either,
     future::{FutureExt, TryFutureExt},
-    ready,
-    stream::{Stream, StreamExt, TryStreamExt},
+    stream::{StreamExt, TryStreamExt},
 };
 use noria::{ReadQuery, ReadReply, Tagged};
 use pin_project::pin_project;
@@ -16,29 +15,45 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem;
 use std::time;
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{future::Future, task::Poll};
 use stream_cancel::Valve;
+use tokio::task_local;
 use tokio_tower::multiplex::server;
 use tower::service_fn;
 
 /// Retry reads every this often.
-const RETRY_TIMEOUT_MS: u64 = 1;
+const RETRY_TIMEOUT: time::Duration = time::Duration::from_micros(100);
 
 /// If a blocking reader finds itself waiting this long for a backfill to complete, it will
 /// re-issue the replay request. To avoid the system falling over if replays are slow for a little
 /// while, waiting readers will use exponential backoff on this delay if they continue to miss.
-const TRIGGER_TIMEOUT_MS: u64 = 10;
+const TRIGGER_TIMEOUT_MS: u64 = 20;
 
-thread_local! {
+task_local! {
     static READERS: RefCell<HashMap<
         (NodeIndex, usize),
         SingleReadHandle,
-    >> = Default::default();
+    >>;
 }
+
+#[derive(Serialize, Debug)]
+#[repr(transparent)]
+#[serde(transparent)]
+struct SerializedReadReplyBatch(Vec<u8>);
+
+impl SerializedReadReplyBatch {
+    fn empty() -> Self {
+        serialize(&[])
+    }
+}
+
+impl From<Vec<u8>> for SerializedReadReplyBatch {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+type Ack = tokio::sync::oneshot::Sender<Result<Tagged<ReadReply<SerializedReadReplyBatch>>, ()>>;
 
 pub(super) async fn listen(
     alive: tokio::sync::mpsc::Sender<()>,
@@ -46,19 +61,6 @@ pub(super) async fn listen(
     mut on: tokio::net::TcpListener,
     readers: Readers,
 ) {
-    // future that ensures all blocking reads are handled in FIFO order
-    // and avoid hogging the executors with read retries
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
-        BlockingRead,
-        tokio::sync::oneshot::Sender<Result<Tagged<ReadReply>, ()>>,
-    )>();
-    tokio::spawn(async move {
-        while let Some((blocking, ack)) = rx.next().await {
-            // if this errors, the client just went away
-            let _ = ack.send(blocking.await);
-        }
-    });
-
     let mut stream = valve.wrap(on.incoming()).into_stream();
     while let Some(stream) = stream.next().await {
         if let Err(_) = stream {
@@ -70,61 +72,115 @@ pub(super) async fn listen(
         let readers = readers.clone();
         stream.set_nodelay(true).expect("could not set TCP_NODELAY");
         let alive = alive.clone();
-        let mut tx = tx.clone();
-        tokio::spawn(
+
+        // future that ensures all blocking reads are handled in FIFO order
+        // and avoid hogging the executors with read retries
+        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(BlockingRead, Ack)>();
+
+        let retries = READERS.scope(Default::default(), async move {
+            use async_timer::Oneshot;
+            let mut retry = async_timer::oneshot::Timer::new(RETRY_TIMEOUT);
+            let mut pending = None::<(BlockingRead, Ack)>;
+            loop {
+                if let Some((ref mut blocking, _)) = pending {
+                    // we have a pending read — see if it can complete
+                    if let Poll::Ready(res) = blocking.check() {
+                        // it did! let's tell the caller.
+                        let (_, ack) = pending.take().expect("we matched on Some above");
+                        // if this errors, the client just went away
+                        let _ = ack.send(res);
+                    // the loop will take care of looking for the next request
+                    } else {
+                        // we have a pending request, but it is still blocked
+                        // time for us to wait...
+                        futures_util::future::poll_fn(|cx| {
+                            // we need the poll_fn so we can get the waker
+                            retry.restart(RETRY_TIMEOUT, cx.waker());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        // we need `(&mut )` here so that we can re-use it
+                        (&mut retry).await;
+                    }
+                } else {
+                    // no point in waiting for a timer if we've got nothing to wait for
+                    // so let's get another request
+                    if let Some(read) = rx.next().await {
+                        pending = Some(read);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        });
+        tokio::spawn(retries);
+
+        let server = READERS.scope(
+            Default::default(),
             server::Server::new(
                 AsyncBincodeStream::from(stream).for_async(),
                 service_fn(move |req| handle_message(req, &readers, &mut tx)),
-            )
-            .map_err(|e| {
-                match e {
-                    server::Error::Service(()) => {
-                        // server is shutting down -- no need to report this error
-                        return;
-                    }
-                    server::Error::BrokenTransportRecv(ref e)
-                    | server::Error::BrokenTransportSend(ref e) => {
-                        if let bincode::ErrorKind::Io(ref e) = **e {
-                            if e.kind() == std::io::ErrorKind::BrokenPipe
-                                || e.kind() == std::io::ErrorKind::ConnectionReset
-                            {
-                                // client went away
-                                return;
+            ),
+        );
+        tokio::spawn(
+            server
+                .map_err(|e| {
+                    match e {
+                        server::Error::Service(()) => {
+                            // server is shutting down -- no need to report this error
+                            return;
+                        }
+                        server::Error::BrokenTransportRecv(ref e)
+                        | server::Error::BrokenTransportSend(ref e) => {
+                            if let bincode::ErrorKind::Io(ref e) = **e {
+                                if e.kind() == std::io::ErrorKind::BrokenPipe
+                                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                                {
+                                    // client went away
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-                eprintln!("!!! reader client protocol error: {:?}", e);
-            })
-            .map(move |r| {
-                let _ = alive;
-                r
-            }),
+                    eprintln!("!!! reader client protocol error: {:?}", e);
+                })
+                .map(move |r| {
+                    let _ = alive;
+                    r
+                }),
         );
     }
 }
 
-fn dup<'a>(rs: impl IntoIterator<Item = &'a Vec<DataType>>) -> Vec<Vec<DataType>> {
-    let rs = rs.into_iter();
-    let mut outer = Vec::with_capacity(rs.size_hint().0);
-    for r in rs {
-        let mut inner = Vec::with_capacity(r.len());
-        for v in r {
-            inner.push(v.deep_clone())
-        }
-        outer.push(inner);
-    }
-    outer
+fn serialize<'a, I>(rs: I) -> SerializedReadReplyBatch
+where
+    I: IntoIterator<Item = &'a Vec<DataType>>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let mut it = rs.into_iter().peekable();
+    let ln = it.len();
+    let fst = it.peek();
+    let mut v = Vec::with_capacity(
+        fst.as_ref()
+            .map(|fst| {
+                // assume all rows are the same length
+                ln * fst.len() * std::mem::size_of::<DataType>()
+            })
+            .unwrap_or(0)
+            + std::mem::size_of::<u64>(/* seq.len */),
+    );
+
+    use serde::ser::Serializer;
+    let mut ser = bincode::Serializer::new(&mut v, bincode::DefaultOptions::default());
+    ser.collect_seq(it).unwrap();
+    SerializedReadReplyBatch(v)
 }
 
 fn handle_message(
     m: Tagged<ReadQuery>,
     s: &Readers,
-    wait: &mut tokio::sync::mpsc::UnboundedSender<(
-        BlockingRead,
-        tokio::sync::oneshot::Sender<Result<Tagged<ReadReply>, ()>>,
-    )>,
-) -> impl Future<Output = Result<Tagged<ReadReply>, ()>> + Send {
+    wait: &mut tokio::sync::mpsc::UnboundedSender<(BlockingRead, Ack)>,
+) -> impl Future<Output = Result<Tagged<ReadReply<SerializedReadReplyBatch>>, ()>> + Send {
     let tag = m.tag;
     match m.v {
         ReadQuery::Normal {
@@ -148,10 +204,10 @@ fn handle_message(
                 keys.retain(|key| {
                     i += 1;
                     if !ready {
-                        ret.push(Vec::new());
+                        ret.push(SerializedReadReplyBatch::empty());
                         return false;
                     }
-                    let rs = reader.try_find_and(key, |rs| dup(rs)).map(|r| r.0);
+                    let rs = reader.try_find_and(key, |rs| serialize(rs)).map(|r| r.0);
                     match rs {
                         Ok(Some(rs)) => {
                             // immediate hit!
@@ -161,13 +217,13 @@ fn handle_message(
                         Err(()) => {
                             // map not yet ready
                             ready = false;
-                            ret.push(Vec::new());
+                            ret.push(SerializedReadReplyBatch::empty());
                             false
                         }
                         Ok(None) => {
                             // need to trigger partial replay for this key
                             pending.push(i as usize);
-                            ret.push(Vec::new());
+                            ret.push(SerializedReadReplyBatch::empty());
                             true
                         }
                     }
@@ -206,7 +262,6 @@ fn handle_message(
                     } else {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         let trigger = time::Duration::from_millis(TRIGGER_TIMEOUT_MS);
-                        let retry = time::Duration::from_millis(RETRY_TIMEOUT_MS);
                         let now = time::Instant::now();
                         let r = wait.send((
                             BlockingRead {
@@ -216,10 +271,6 @@ fn handle_message(
                                 pending,
                                 read: ret,
                                 truth: s.clone(),
-                                retry: tokio::time::interval_at(
-                                    tokio::time::Instant::from_std(now + retry),
-                                    retry,
-                                ),
                                 trigger_timeout: trigger,
                                 next_trigger: now,
                                 first: now,
@@ -261,103 +312,317 @@ fn handle_message(
 struct BlockingRead {
     tag: u32,
     target: (NodeIndex, usize),
-    // records for keys we have already read
-    read: Vec<Vec<Vec<DataType>>>,
+    // serialized records for keys we have already read
+    read: Vec<SerializedReadReplyBatch>,
     // keys we have yet to read
     keys: Vec<Vec<DataType>>,
     // index in self.read that each entyr in keys corresponds to
     pending: Vec<usize>,
     truth: Readers,
 
-    #[pin]
-    retry: tokio::time::Interval,
-
     trigger_timeout: time::Duration,
     next_trigger: time::Instant,
     first: time::Instant,
 }
 
-impl Future for BlockingRead {
-    type Output = Result<Tagged<ReadReply>, ()>;
+impl std::fmt::Debug for BlockingRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingRead")
+            .field("tag", &self.tag)
+            .field("target", &self.target)
+            .field("read", &self.read)
+            .field("keys", &self.keys)
+            .field("pending", &self.pending)
+            .field("trigger_timeout", &self.trigger_timeout)
+            .field("next_trigger", &self.next_trigger)
+            .field("first", &self.first)
+            .finish()
+    }
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        loop {
-            ready!(this.retry.as_mut().poll_next(cx));
+impl BlockingRead {
+    fn check(&mut self) -> Poll<Result<Tagged<ReadReply<SerializedReadReplyBatch>>, ()>> {
+        READERS.with(|readers_cache| {
+            let mut readers_cache = readers_cache.borrow_mut();
+            let s = &self.truth;
+            let target = &self.target;
+            let reader = readers_cache.entry(self.target).or_insert_with(|| {
+                let readers = s.lock().unwrap();
+                readers.get(target).unwrap().clone()
+            });
 
-            READERS.with(|readers_cache| {
-                let mut readers_cache = readers_cache.borrow_mut();
-                let s = &this.truth;
-                let target = &this.target;
-                let reader = readers_cache.entry(*this.target).or_insert_with(|| {
-                    let readers = s.lock().unwrap();
-                    readers.get(target).unwrap().clone()
-                });
+            let now = time::Instant::now();
+            let read = &mut self.read;
+            let next_trigger = self.next_trigger;
 
-                let now = time::Instant::now();
-                let read = &mut this.read;
-                let next_trigger = *this.next_trigger;
+            // here's the trick we're going to play:
+            // we're going to re-try the lookups starting with the _last_ key.
+            // if it hits, we move on to the second-to-last, and so on.
+            // the moment we miss again, we yield immediately, rather than continue.
+            // this avoids shuffling around self.pending and self.keys, and probably doesn't
+            // really cost us anything -- we couldn't return ready anyway!
 
-                // here's the trick we're going to play:
-                // we're going to re-try the lookups starting with the _last_ key.
-                // if it hits, we move on to the second-to-last, and so on.
-                // the moment we miss again, we yield immediately, rather than continue.
-                // this avoids shuffling around self.pending and self.keys, and probably doesn't
-                // really cost us anything -- we couldn't return ready anyway!
-
-                while let Some(read_i) = this.pending.pop() {
-                    let key = this.keys.pop().expect("pending.len() == keys.len()");
-                    match reader.try_find_and(&key, |rs| dup(rs)).map(|r| r.0) {
-                        Ok(Some(rs)) => {
-                            read[read_i] = rs;
-                        }
-                        Err(()) => {
-                            // map has been deleted, so server is shutting down
-                            this.pending.clear();
-                            this.keys.clear();
-                            return Err(());
-                        }
-                        Ok(None) => {
-                            // we still missed! restore key + pending
-                            this.pending.push(read_i);
-                            this.keys.push(key);
-                            break;
-                        }
+            while let Some(read_i) = self.pending.pop() {
+                let key = self.keys.pop().expect("pending.len() == keys.len()");
+                match reader.try_find_and(&key, |rs| serialize(rs)).map(|r| r.0) {
+                    Ok(Some(rs)) => {
+                        read[read_i] = rs;
                     }
-                }
-                debug_assert_eq!(this.pending.len(), this.keys.len());
-
-                if !this.keys.is_empty() && now > next_trigger {
-                    // maybe the key got filled, then evicted, and we missed it?
-                    if !reader.trigger(this.keys.iter().map(Vec::as_slice)) {
-                        // server is shutting down and won't do the backfill
+                    Err(()) => {
+                        // map has been deleted, so server is shutting down
+                        self.pending.clear();
+                        self.keys.clear();
                         return Err(());
                     }
-
-                    *this.trigger_timeout *= 2;
-                    *this.next_trigger = now + *this.trigger_timeout;
-                }
-
-                if !this.keys.is_empty() {
-                    let waited = now - *this.first;
-                    *this.first = now;
-                    if waited > time::Duration::from_secs(7) {
-                        eprintln!(
-                            "warning: read has been stuck waiting on {:?} for {:?}",
-                            this.keys, waited
-                        );
+                    Ok(None) => {
+                        // we still missed! restore key + pending
+                        self.pending.push(read_i);
+                        self.keys.push(key);
+                        break;
                     }
                 }
+            }
+            debug_assert_eq!(self.pending.len(), self.keys.len());
 
-                Ok(())
-            })?;
+            if !self.keys.is_empty() && now > next_trigger {
+                // maybe the key got filled, then evicted, and we missed it?
+                if !reader.trigger(self.keys.iter().map(Vec::as_slice)) {
+                    // server is shutting down and won't do the backfill
+                    return Err(());
+                }
 
-            if this.keys.is_empty() {
-                return Poll::Ready(Ok(Tagged {
-                    tag: *this.tag,
-                    v: ReadReply::Normal(Ok(mem::replace(&mut this.read, Vec::new()))),
-                }));
+                self.trigger_timeout *= 2;
+                self.next_trigger = now + self.trigger_timeout;
+            }
+
+            if !self.keys.is_empty() {
+                let waited = now - self.first;
+                self.first = now;
+                if waited > time::Duration::from_secs(7) {
+                    eprintln!(
+                        "warning: read has been stuck waiting on {:?} for {:?}",
+                        self.keys, waited
+                    );
+                }
+            }
+
+            Ok(())
+        })?;
+
+        if self.keys.is_empty() {
+            Poll::Ready(Ok(Tagged {
+                tag: self.tag,
+                v: ReadReply::Normal(Ok(mem::take(&mut self.read))),
+            }))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod readreply {
+    use super::SerializedReadReplyBatch;
+    use noria::{DataType, ReadReply, Tagged};
+
+    fn rtt_ok(data: Vec<Vec<Vec<DataType>>>) {
+        let got: Tagged<ReadReply> = bincode::deserialize(
+            &bincode::serialize(&Tagged {
+                tag: 32,
+                v: ReadReply::Normal::<SerializedReadReplyBatch>(Ok(data
+                    .iter()
+                    .map(|d| super::serialize(d))
+                    .collect())),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        match got {
+            Tagged {
+                v: ReadReply::Normal(Ok(got)),
+                tag: 32,
+            } => {
+                assert_eq!(got.len(), data.len());
+                for (got, expected) in got.into_iter().zip(data.into_iter()) {
+                    assert_eq!(&*got, &expected);
+                }
+            }
+            r => panic!("{:?}", r),
+        }
+    }
+
+    #[test]
+    fn rtt_normal_empty() {
+        let got: Tagged<ReadReply> = bincode::deserialize(
+            &bincode::serialize(&Tagged {
+                tag: 32,
+                v: ReadReply::Normal::<SerializedReadReplyBatch>(Ok(Vec::new())),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        match got {
+            Tagged {
+                v: ReadReply::Normal(Ok(data)),
+                tag: 32,
+            } => {
+                assert!(data.is_empty());
+            }
+            r => panic!("{:?}", r),
+        }
+    }
+
+    #[test]
+    fn rtt_normal_one() {
+        rtt_ok(vec![vec![vec![DataType::from(1)]]]);
+    }
+
+    #[test]
+    fn rtt_normal_multifield() {
+        rtt_ok(vec![vec![vec![DataType::from(1), DataType::from(42)]]]);
+    }
+
+    #[test]
+    fn rtt_normal_multirow() {
+        rtt_ok(vec![vec![
+            vec![DataType::from(1)],
+            vec![DataType::from(42)],
+        ]]);
+    }
+
+    #[test]
+    fn rtt_normal_multibatch() {
+        rtt_ok(vec![
+            vec![vec![DataType::from(1)]],
+            vec![vec![DataType::from(42)]],
+        ]);
+    }
+
+    #[test]
+    fn rtt_normal_multi() {
+        rtt_ok(vec![
+            vec![
+                vec![DataType::from(1), DataType::from(42)],
+                vec![DataType::from(43), DataType::from(2)],
+            ],
+            vec![
+                vec![DataType::from(2), DataType::from(43)],
+                vec![DataType::from(44), DataType::from(3)],
+            ],
+        ]);
+    }
+
+    #[test]
+    fn rtt_normal_err() {
+        let got: Tagged<ReadReply> = bincode::deserialize(
+            &bincode::serialize(&Tagged {
+                tag: 32,
+                v: ReadReply::Normal::<SerializedReadReplyBatch>(Err(())),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            got,
+            Tagged {
+                tag: 32,
+                v: ReadReply::Normal(Err(()))
+            }
+        ));
+    }
+
+    #[test]
+    fn rtt_size() {
+        let got: Tagged<ReadReply> = bincode::deserialize(
+            &bincode::serialize(&Tagged {
+                tag: 32,
+                v: ReadReply::Size::<SerializedReadReplyBatch>(42),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            got,
+            Tagged {
+                tag: 32,
+                v: ReadReply::Size(42)
+            }
+        ));
+    }
+
+    async fn async_bincode_rtt_ok(data: Vec<Vec<Vec<DataType>>>) {
+        use futures_util::{SinkExt, StreamExt};
+
+        let mut z = Vec::new();
+        let mut w = async_bincode::AsyncBincodeWriter::from(&mut z).for_async();
+
+        for tag in 0..10 {
+            w.send(Tagged {
+                tag,
+                v: ReadReply::Normal::<SerializedReadReplyBatch>(Ok(data
+                    .iter()
+                    .map(|d| super::serialize(d))
+                    .collect())),
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut r = async_bincode::AsyncBincodeReader::<_, Tagged<ReadReply>>::from(
+            std::io::Cursor::new(&z[..]),
+        );
+
+        for tag in 0..10 {
+            let got: Tagged<ReadReply> = r.next().await.unwrap().unwrap();
+
+            match got {
+                Tagged {
+                    v: ReadReply::Normal(Ok(got)),
+                    tag: t,
+                } => {
+                    assert_eq!(tag, t);
+                    assert_eq!(got.len(), data.len());
+                    for (got, expected) in got.into_iter().zip(data.iter()) {
+                        assert_eq!(&*got, expected);
+                    }
+                }
+                r => panic!("{:?}", r),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn async_bincode_rtt_empty() {
+        async_bincode_rtt_ok(vec![]).await;
+    }
+
+    #[tokio::test]
+    async fn async_bincode_rtt_one_empty() {
+        async_bincode_rtt_ok(vec![vec![]]).await;
+    }
+
+    #[tokio::test]
+    async fn async_bincode_rtt_one_one_empty() {
+        async_bincode_rtt_ok(vec![vec![vec![]]]).await;
+    }
+
+    #[tokio::test]
+    async fn async_bincode_rtt_multi() {
+        async_bincode_rtt_ok(vec![
+            vec![
+                vec![DataType::from(1), DataType::from(42)],
+                vec![DataType::from(43), DataType::from(2)],
+            ],
+            vec![
+                vec![DataType::from(2), DataType::from(43)],
+                vec![DataType::from(44), DataType::from(3)],
+            ],
+            vec![vec![]],
+            vec![],
+        ])
+        .await;
     }
 }
